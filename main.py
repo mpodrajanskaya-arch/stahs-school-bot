@@ -11,8 +11,8 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
 import portal
@@ -27,6 +27,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📬 Новые сообщения"), KeyboardButton("📅 За 3 дня")],
+        [KeyboardButton("📋 Последние 5"),     KeyboardButton("🔄 Сбросить")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "19"))
 DIGEST_MINUTE = int(os.getenv("DIGEST_MINUTE", "0"))
@@ -101,12 +110,14 @@ async def send_digest(app: Application, chat_id: int | None = None, force_days: 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я буду присылать тебе дайджест сообщений от школы каждый вечер.\n\n"
-        "Команды:\n"
-        "/digest — новые сообщения (с прошлого раза)\n"
-        "/today — сообщения за последние 3 дня\n"
-        "/latest — последние 5 сообщений (заголовки)\n"
-        "/read <id> — прочитать полное сообщение\n"
-        "/reset — сбросить счётчик прочитанных"
+        "Нажимай кнопки внизу 👇\n\n"
+        "Или вручную:\n"
+        "/digest — новые сообщения\n"
+        "/today — за последние 3 дня\n"
+        "/latest — последние 5 (заголовки)\n"
+        "/read <id> — полное сообщение\n"
+        "/reset — сбросить счётчик",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -124,8 +135,23 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if STATE_FILE.exists():
         STATE_FILE.unlink()
     await update.message.reply_text(
-        "✅ Сброшено. Теперь /digest покажет все непрочитанные сообщения."
+        "✅ Сброшено. Теперь /digest покажет все непрочитанные сообщения.",
+        reply_markup=MAIN_KEYBOARD,
     )
+
+
+async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "📬 Новые сообщения":
+        await update.message.reply_text("⏳ Загружаю новые сообщения...")
+        await send_digest(ctx.application, chat_id=update.effective_chat.id)
+    elif text == "📅 За 3 дня":
+        await update.message.reply_text("⏳ Загружаю сообщения за последние 3 дня...")
+        await send_digest(ctx.application, chat_id=update.effective_chat.id, force_days=3)
+    elif text == "📋 Последние 5":
+        await cmd_latest(update, ctx)
+    elif text == "🔄 Сбросить":
+        await cmd_reset(update, ctx)
 
 
 async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -190,6 +216,7 @@ def main():
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("read", cmd_read))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
     log.info("Bot started. Polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
