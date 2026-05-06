@@ -71,18 +71,14 @@ async def summarize(messages: list[dict]) -> tuple[list[str], list[dict]]:
 
 
 async def _summarize_with_claude(messages: list[dict]) -> tuple[str, list[dict]]:
+    # Use subject + built-in summary only — no extra portal requests
     details = []
-    for m in messages[:4]:
-        try:
-            thread = _portal.get_thread(m["id"])
-            body = thread["body"][:800]
-        except Exception:
-            body = m.get("summary", "")
-        details.append(f"[{_portal.format_date(m['received'])}] {m['subject']}\n{body}")
-
-    if len(messages) > 4:
-        for m in messages[4:]:
-            details.append(f"[{_portal.format_date(m['received'])}] {m['subject']}")
+    for m in messages:
+        summary = m.get("summary", "")
+        line = f"[{_portal.format_date(m['received'])}] {m['subject']}"
+        if summary:
+            line += f"\n{summary[:300]}"
+        details.append(line)
 
     today = datetime.now().strftime("%-d %b %Y")
     current_year = datetime.now().year
