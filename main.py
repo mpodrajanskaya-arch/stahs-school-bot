@@ -17,6 +17,7 @@ from telegram.constants import ParseMode
 
 import portal
 import summarizer
+import gcal
 
 load_dotenv()
 
@@ -97,27 +98,51 @@ async def send_digest(app: Application, chat_id: int | None = None, force_days: 
                 link_preview_options={"is_disabled": True},
             )
 
-        # Send calendar buttons if events were found
+        # Handle calendar events
         if events:
-            buttons = []
-            for ev in events:
-                url = summarizer.gcal_url(
-                    title=ev.get("title", ""),
-                    date=ev.get("date", ""),
-                    time_start=ev.get("time_start", ""),
-                    time_end=ev.get("time_end", ""),
-                    details=ev.get("details", "STAHS School"),
-                )
-                if url:
-                    label = f"📆 {ev['title']} — {ev.get('date_label', ev.get('date',''))}"
-                    buttons.append([InlineKeyboardButton(label, url=url)])
-            if buttons:
-                await app.bot.send_message(
-                    chat_id=target,
-                    text="<b>📅 Добавить в Google Calendar:</b>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
+            if gcal.is_authorized():
+                # Auto-add to Google Calendar
+                added, skipped = [], []
+                for ev in events:
+                    try:
+                        link = gcal.create_event(
+                            title=ev.get("title", ""),
+                            date=ev.get("date", ""),
+                            time_start=ev.get("time_start", ""),
+                            time_end=ev.get("time_end", ""),
+                            details=ev.get("details", "STAHS School"),
+                        )
+                        added.append(f"✅ {ev['title']} — {ev.get('date_label', ev.get('date',''))}")
+                    except Exception as e:
+                        log.warning(f"Calendar event failed: {e}")
+                        skipped.append(ev.get("title", ""))
+                if added:
+                    await app.bot.send_message(
+                        chat_id=target,
+                        text="<b>📅 Добавлено в Google Calendar:</b>\n" + "\n".join(added),
+                        parse_mode=ParseMode.HTML,
+                    )
+            else:
+                # Not authorized yet — show buttons
+                buttons = []
+                for ev in events:
+                    url = summarizer.gcal_url(
+                        title=ev.get("title", ""),
+                        date=ev.get("date", ""),
+                        time_start=ev.get("time_start", ""),
+                        time_end=ev.get("time_end", ""),
+                        details=ev.get("details", "STAHS School"),
+                    )
+                    if url:
+                        label = f"📆 {ev['title']} — {ev.get('date_label', ev.get('date',''))}"
+                        buttons.append([InlineKeyboardButton(label, url=url)])
+                if buttons:
+                    await app.bot.send_message(
+                        chat_id=target,
+                        text="<b>📅 События — нажми чтобы добавить в календарь:</b>\n\n<i>Или используй /auth_calendar чтобы бот добавлял сам</i>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(buttons),
+                    )
 
         log.info(f"Digest sent: {len(messages)} messages, {len(chunks)} chunk(s), {len(events)} events.")
 
@@ -153,6 +178,35 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Загружаю сообщения за последние 3 дня...")
     await send_digest(ctx.application, chat_id=update.effective_chat.id, force_days=3)
+
+
+async def cmd_auth_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not gcal.CLIENT_ID:
+        await update.message.reply_text("⚠️ GCAL_CLIENT_ID не задан в настройках бота.")
+        return
+    if gcal.is_authorized():
+        await update.message.reply_text("✅ Google Calendar уже подключён!")
+        return
+    url = gcal.get_auth_url()
+    await update.message.reply_text(
+        f"Открой эту ссылку, разреши доступ и скопируй код обратно сюда:\n\n{url}\n\n"
+        "После этого отправь мне код командой:\n<code>/gcal_code ВАШ_КОД</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_gcal_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Использование: /gcal_code КОД")
+        return
+    code = ctx.args[0]
+    try:
+        gcal.exchange_code(code)
+        await update.message.reply_text(
+            "✅ Google Calendar подключён! Теперь бот будет автоматически добавлять события из школьных писем."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -240,6 +294,8 @@ def main():
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("read", cmd_read))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("auth_calendar", cmd_auth_calendar))
+    app.add_handler(CommandHandler("gcal_code", cmd_gcal_code))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
     log.info("Bot started. Polling...")
