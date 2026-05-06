@@ -31,11 +31,20 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📬 Новые сообщения"), KeyboardButton("📅 За 3 дня")],
-        [KeyboardButton("📋 Последние 5"),     KeyboardButton("🔄 Сбросить")],
+        [KeyboardButton("1️⃣ Новые сообщения"), KeyboardButton("2️⃣ За 3 дня")],
+        [KeyboardButton("3️⃣ Последние 5"),     KeyboardButton("4️⃣ Сбросить")],
     ],
     resize_keyboard=True,
     is_persistent=True,
+)
+
+MENU_TEXT = (
+    "Выбери опцию:\n\n"
+    "1️⃣ — новые сообщения (с прошлого раза)\n"
+    "2️⃣ — дайджест за последние 3 дня\n"
+    "3️⃣ — последние 5 сообщений (заголовки)\n"
+    "4️⃣ — сбросить счётчик прочитанных\n\n"
+    "Нажимай кнопки внизу или просто отправь цифру 👇"
 )
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "19"))
@@ -158,14 +167,8 @@ async def send_digest(app: Application, chat_id: int | None = None, force_days: 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я буду присылать тебе дайджест сообщений от школы каждый вечер.\n\n"
-        "Нажимай кнопки внизу 👇\n\n"
-        "Или вручную:\n"
-        "/digest — новые сообщения\n"
-        "/today — за последние 3 дня\n"
-        "/latest — последние 5 (заголовки)\n"
-        "/read <id> — полное сообщение\n"
-        "/reset — сбросить счётчик",
+        "👋 Привет! Я слежу за письмами школы STAHS и присылаю дайджест каждый вечер в 19:00.\n\n"
+        + MENU_TEXT,
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -222,17 +225,20 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "📬 Новые сообщения":
+    text = update.message.text.strip()
+
+    if text in ("1", "1️⃣ Новые сообщения"):
         await update.message.reply_text("⏳ Загружаю новые сообщения...")
         await send_digest(ctx.application, chat_id=update.effective_chat.id)
-    elif text == "📅 За 3 дня":
+    elif text in ("2", "2️⃣ За 3 дня"):
         await update.message.reply_text("⏳ Загружаю сообщения за последние 3 дня...")
         await send_digest(ctx.application, chat_id=update.effective_chat.id, force_days=3)
-    elif text == "📋 Последние 5":
+    elif text in ("3", "3️⃣ Последние 5"):
         await cmd_latest(update, ctx)
-    elif text == "🔄 Сбросить":
+    elif text in ("4", "4️⃣ Сбросить"):
         await cmd_reset(update, ctx)
+    else:
+        await update.message.reply_text(MENU_TEXT, reply_markup=MAIN_KEYBOARD)
 
 
 async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
