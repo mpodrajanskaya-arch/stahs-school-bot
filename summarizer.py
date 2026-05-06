@@ -39,62 +39,35 @@ def chunk_message(text: str) -> list[str]:
     return chunks
 
 
-def _gcal_link(title: str, date: str, time_start: str = "", time_end: str = "", details: str = "") -> str:
-    """Generate a Google Calendar quick-add URL."""
+def gcal_url(title: str, date: str, time_start: str = "", time_end: str = "", details: str = "") -> str:
     try:
         if time_start:
-            # With time: YYYYMMDDTHHmmss / YYYYMMDDTHHmmss
             d = datetime.strptime(f"{date} {time_start}", "%Y-%m-%d %H:%M")
-            if time_end:
-                d_end = datetime.strptime(f"{date} {time_end}", "%Y-%m-%d %H:%M")
-            else:
-                d_end = d + timedelta(hours=1)
+            d_end = datetime.strptime(f"{date} {time_end}", "%Y-%m-%d %H:%M") if time_end else d + timedelta(hours=1)
             dates = f"{d.strftime('%Y%m%dT%H%M%S')}/{d_end.strftime('%Y%m%dT%H%M%S')}"
         else:
-            # All-day: YYYYMMDD / YYYYMMDD (next day)
             d = datetime.strptime(date, "%Y-%m-%d")
-            d_end = d + timedelta(days=1)
-            dates = f"{d.strftime('%Y%m%d')}/{d_end.strftime('%Y%m%d')}"
+            dates = f"{d.strftime('%Y%m%d')}/{(d + timedelta(days=1)).strftime('%Y%m%d')}"
     except ValueError:
         return ""
-
     params = f"action=TEMPLATE&text={quote(title)}&dates={dates}"
     if details:
         params += f"&details={quote(details[:200])}"
     return f"https://calendar.google.com/calendar/render?{params}"
 
 
-def _build_calendar_block(events: list[dict]) -> str:
-    """Turn a list of event dicts into a Telegram HTML block with calendar links."""
-    if not events:
-        return ""
-    lines = ["\n<b>📅 Добавить в календарь:</b>"]
-    for ev in events:
-        link = _gcal_link(
-            title=ev.get("title", ""),
-            date=ev.get("date", ""),
-            time_start=ev.get("time_start", ""),
-            time_end=ev.get("time_end", ""),
-            details=ev.get("details", "STAHS School"),
-        )
-        date_label = ev.get("date_label", ev.get("date", ""))
-        if link:
-            lines.append(f'📆 <a href="{link}">{ev["title"]} — {date_label}</a>')
-        else:
-            lines.append(f'📆 {ev["title"]} — {date_label}')
-    return "\n".join(lines)
+async def summarize(messages: list[dict]) -> tuple[list[str], list[dict]]:
+    """Return (text_chunks, events_list).
 
-
-async def summarize(messages: list[dict]) -> list[str]:
+    text_chunks: HTML-formatted Telegram messages
+    events_list: [{title, date, date_label, time_start, time_end, details}]
+    """
     if _client:
         summary, events = await _summarize_with_claude(messages)
     else:
         summary = _format_plain(messages)
         events = []
-
-    calendar_block = _build_calendar_block(events)
-    full_text = summary + calendar_block if calendar_block else summary
-    return chunk_message(full_text)
+    return chunk_message(summary), events
 
 
 async def _summarize_with_claude(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -115,22 +88,26 @@ async def _summarize_with_claude(messages: list[dict]) -> tuple[str, list[dict]]
     current_year = datetime.now().year
     messages_text = chr(10).join(f"{i+1}. {d}" for i, d in enumerate(details))
 
-    # Call 1: summary digest
     summary_prompt = f"""Ты помогаешь маме ученицы 5-го класса (Year 5) британской школы STAHS.
 
 Вот {len(messages)} новых сообщений:
 {messages_text}
 
-Сделай краткий дайджест на русском. Используй только HTML-теги <b> и <i>.
+Сделай дайджест на русском. Используй только HTML-теги <b> и <i>.
+
+Формат строго такой — три блока:
 
 <b>📚 Дайджест школы — {today}</b>
 <b>{len(messages)} новых сообщений</b>
 
-<b>Что важно:</b>
-[Для каждого сообщения — одно предложение. Пропусти рассылки без действий.]
+<b>🔴 Требует действия:</b>
+[Только то, что нужно сделать маме: заплатить, подписать, ответить, зарегистрироваться, дать разрешение. Каждый пункт — новая строка, начиная с •. Если ничего — напиши "Нет".]
 
-<b>✅ Что нужно сделать:</b>
-[Action items: формы, деньги, RSVP. Если ничего — "Ничего не требуется".]"""
+<b>📌 Важно для Year 5:</b>
+[Информация, которая касается именно Year 5 или всей Prep school: мероприятия, поездки, изменения расписания. Одно предложение на пункт, начиная с •. Если ничего — "Нет".]
+
+<b>ℹ️ Остальное:</b>
+[Общие письма без действий: советы по здоровью, новости школы, общая информация. Одно предложение на пункт, начиная с •. Не больше 3 пунктов. Если ничего — "Нет".]"""
 
     r1 = _client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -139,27 +116,30 @@ async def _summarize_with_claude(messages: list[dict]) -> tuple[str, list[dict]]
     )
     summary = r1.content[0].text.strip()
 
-    # Call 2: extract events as JSON
-    events_prompt = f"""Extract all events with specific dates from these school messages.
-Return ONLY a valid JSON array. No explanation, no markdown, just JSON.
-Format: [{{"title":"название на русском","date":"YYYY-MM-DD","time_start":"HH:MM or empty","time_end":"HH:MM or empty","date_label":"21 мая","details":"brief note"}}]
-If no events with specific dates, return [].
+    # Use only subjects for date extraction — dates are almost always in the subject line
+    subjects_text = chr(10).join(
+        f"{i+1}. {m['subject']} [{m['received'][:10]}]"
+        for i, m in enumerate(messages)
+    )
+    events_prompt = f"""Extract all events with specific dates from these school message subjects.
+Return ONLY a valid JSON array, no markdown, no explanation.
+Each object: {{"title":"event name in Russian","date":"YYYY-MM-DD","time_start":"HH:MM or empty","time_end":"HH:MM or empty","date_label":"21 мая","details":"brief note"}}
+Only events with a specific date. If none, return [].
 Current year: {current_year}.
 
-Messages:
-{messages_text}"""
+{subjects_text}"""
 
     r2 = _client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=600,
+        max_tokens=800,
         messages=[{"role": "user", "content": events_prompt}],
     )
     events = []
     try:
-        raw_events = r2.content[0].text.strip()
-        json_match = re.search(r"\[.*\]", raw_events, re.DOTALL)
-        if json_match:
-            events = json.loads(json_match.group())
+        raw = r2.content[0].text.strip()
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        if m:
+            events = json.loads(m.group())
     except Exception:
         events = []
 
@@ -173,12 +153,10 @@ def _format_plain(messages: list[dict]) -> str:
         f"<b>{len(messages)} новых сообщений</b>\n",
     ]
     for m in messages[:10]:
-        date_str = _portal.format_date(m["received"])
         lines.append(f"📌 <b>{m['subject']}</b>")
-        lines.append(f"<i>{date_str}</i>")
-        summary = m.get("summary", "")
-        if summary:
-            lines.append(f"{summary[:200]}")
+        lines.append(f"<i>{_portal.format_date(m['received'])}</i>")
+        if m.get("summary"):
+            lines.append(m["summary"][:200])
         lines.append(f"<code>/read {m['id']}</code>\n")
     if len(messages) > 10:
         lines.append(f"<i>...и ещё {len(messages) - 10} сообщений</i>")

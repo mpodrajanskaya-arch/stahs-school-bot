@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
@@ -87,15 +87,39 @@ async def send_digest(app: Application, chat_id: int | None = None, force_days: 
         if force_days is None:
             _save_last_seen(messages[0]["id"])
 
-        chunks = await summarizer.summarize(messages)
+        chunks, events = await summarizer.summarize(messages)
 
         for chunk in chunks:
             await app.bot.send_message(
                 chat_id=target,
                 text=chunk,
                 parse_mode=ParseMode.HTML,
+                link_preview_options={"is_disabled": True},
             )
-        log.info(f"Digest sent: {len(messages)} messages, {len(chunks)} chunk(s).")
+
+        # Send calendar buttons if events were found
+        if events:
+            buttons = []
+            for ev in events:
+                url = summarizer.gcal_url(
+                    title=ev.get("title", ""),
+                    date=ev.get("date", ""),
+                    time_start=ev.get("time_start", ""),
+                    time_end=ev.get("time_end", ""),
+                    details=ev.get("details", "STAHS School"),
+                )
+                if url:
+                    label = f"📆 {ev['title']} — {ev.get('date_label', ev.get('date',''))}"
+                    buttons.append([InlineKeyboardButton(label, url=url)])
+            if buttons:
+                await app.bot.send_message(
+                    chat_id=target,
+                    text="<b>📅 Добавить в Google Calendar:</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+
+        log.info(f"Digest sent: {len(messages)} messages, {len(chunks)} chunk(s), {len(events)} events.")
 
     except Exception as e:
         log.error(f"Digest error: {e}", exc_info=True)
