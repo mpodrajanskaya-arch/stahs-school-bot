@@ -1,11 +1,14 @@
 """
-STAHS School Bot — daily digest of school communications via Telegram.
-Runs a scheduled digest every evening and supports on-demand commands.
+STAHS School Bot — monitors school communications and sends Telegram digests.
+- Checks for new messages every 30 minutes, sends immediately if found
+- Daily digest at 19:00 (silent if nothing new)
+- Morning reminders at 8:00 for events happening today or tomorrow
 """
 
+import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -28,6 +31,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "19"))
+DIGEST_MINUTE = int(os.getenv("DIGEST_MINUTE", "0"))
+TZ = ZoneInfo(os.getenv("TZ", "Europe/London"))
+
+STATE_FILE = Path(__file__).parent / ".last_seen.txt"
+EVENTS_FILE = Path(__file__).parent / ".upcoming_events.json"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -46,13 +56,9 @@ MENU_TEXT = (
     "4️⃣ — сбросить счётчик прочитанных\n\n"
     "Нажимай кнопки внизу или просто отправь цифру 👇"
 )
-CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
-DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "19"))
-DIGEST_MINUTE = int(os.getenv("DIGEST_MINUTE", "0"))
-TZ = ZoneInfo(os.getenv("TZ", "Europe/London"))
 
-STATE_FILE = Path(__file__).parent / ".last_seen.txt"
 
+# ── State helpers ─────────────────────────────────────────────────────────────
 
 def _load_last_seen() -> str | None:
     if STATE_FILE.exists():
@@ -64,110 +70,167 @@ def _save_last_seen(thread_id: str):
     STATE_FILE.write_text(thread_id)
 
 
-async def send_digest(app: Application, chat_id: int | None = None, force_days: int | None = None):
-    """Fetch new messages, summarize, send to Telegram.
-
-    force_days: if set, ignore last_seen and return messages from the last N days.
-    """
-    target = chat_id or CHAT_ID
-    log.info("Running digest...")
+def _save_events(events: list[dict]):
+    """Persist upcoming events so reminders can check them without re-fetching."""
     try:
-        if force_days is not None:
-            all_msgs = portal.get_communications(limit=50)
-            cutoff = datetime.now(timezone.utc) - timedelta(days=force_days)
-            messages = []
-            for m in all_msgs:
+        existing = _load_events()
+        # Merge by (title, date) — avoid duplicates
+        keys = {(e["title"], e["date"]) for e in existing}
+        for ev in events:
+            if (ev.get("title"), ev.get("date")) not in keys:
+                existing.append(ev)
+        EVENTS_FILE.write_text(json.dumps(existing))
+    except Exception:
+        EVENTS_FILE.write_text(json.dumps(events))
+
+
+def _load_events() -> list[dict]:
+    if EVENTS_FILE.exists():
+        try:
+            return json.loads(EVENTS_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+
+# ── Core digest logic ─────────────────────────────────────────────────────────
+
+async def _send_messages_and_events(app, target: int, messages: list[dict]):
+    """Summarize messages and send to target chat, including calendar handling."""
+    chunks, events = await summarizer.summarize(messages)
+
+    for chunk in chunks:
+        await app.bot.send_message(
+            chat_id=target,
+            text=chunk,
+            parse_mode=ParseMode.HTML,
+            link_preview_options={"is_disabled": True},
+        )
+
+    if events:
+        _save_events(events)
+
+        if gcal.is_authorized():
+            added = []
+            for ev in events:
                 try:
-                    received = datetime.fromisoformat(m["received"].replace("Z", "+00:00"))
-                    if received >= cutoff:
-                        messages.append(m)
-                except Exception:
-                    messages.append(m)
-        else:
-            last_seen = _load_last_seen()
-            messages = portal.get_new_communications(last_seen)
-
-        if not messages:
-            await app.bot.send_message(
-                chat_id=target,
-                text="📭 Новых сообщений от школы нет.",
-            )
-            return
-
-        if force_days is None:
-            _save_last_seen(messages[0]["id"])
-
-        chunks, events = await summarizer.summarize(messages)
-
-        for chunk in chunks:
-            await app.bot.send_message(
-                chat_id=target,
-                text=chunk,
-                parse_mode=ParseMode.HTML,
-                link_preview_options={"is_disabled": True},
-            )
-
-        # Handle calendar events
-        if events:
-            if gcal.is_authorized():
-                # Auto-add to Google Calendar
-                added, skipped = [], []
-                for ev in events:
-                    try:
-                        link = gcal.create_event(
-                            title=ev.get("title", ""),
-                            date=ev.get("date", ""),
-                            time_start=ev.get("time_start", ""),
-                            time_end=ev.get("time_end", ""),
-                            details=ev.get("details", "STAHS School"),
-                        )
-                        added.append(f"✅ {ev['title']} — {ev.get('date_label', ev.get('date',''))}")
-                    except Exception as e:
-                        log.warning(f"Calendar event failed: {e}")
-                        skipped.append(ev.get("title", ""))
-                if added:
-                    await app.bot.send_message(
-                        chat_id=target,
-                        text="<b>📅 Добавлено в Google Calendar:</b>\n" + "\n".join(added),
-                        parse_mode=ParseMode.HTML,
-                    )
-            else:
-                # Not authorized yet — show buttons
-                buttons = []
-                for ev in events:
-                    url = summarizer.gcal_url(
+                    gcal.create_event(
                         title=ev.get("title", ""),
                         date=ev.get("date", ""),
                         time_start=ev.get("time_start", ""),
                         time_end=ev.get("time_end", ""),
                         details=ev.get("details", "STAHS School"),
                     )
-                    if url:
-                        label = f"📆 {ev['title']} — {ev.get('date_label', ev.get('date',''))}"
-                        buttons.append([InlineKeyboardButton(label, url=url)])
-                if buttons:
-                    await app.bot.send_message(
-                        chat_id=target,
-                        text="<b>📅 События — нажми чтобы добавить в календарь:</b>\n\n<i>Или используй /auth_calendar чтобы бот добавлял сам</i>",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(buttons),
-                    )
+                    added.append(f"✅ {ev['title']} — {ev.get('date_label', ev.get('date', ''))}")
+                except Exception as e:
+                    log.warning(f"Calendar event failed: {e}")
+            if added:
+                await app.bot.send_message(
+                    chat_id=target,
+                    text="<b>📅 Добавлено в Google Calendar:</b>\n" + "\n".join(added),
+                    parse_mode=ParseMode.HTML,
+                )
+        else:
+            buttons = []
+            for ev in events:
+                url = summarizer.gcal_url(
+                    title=ev.get("title", ""),
+                    date=ev.get("date", ""),
+                    time_start=ev.get("time_start", ""),
+                    time_end=ev.get("time_end", ""),
+                    details=ev.get("details", "STAHS School"),
+                )
+                if url:
+                    buttons.append([InlineKeyboardButton(
+                        f"📆 {ev['title']} — {ev.get('date_label', ev.get('date', ''))}",
+                        url=url,
+                    )])
+            if buttons:
+                await app.bot.send_message(
+                    chat_id=target,
+                    text="<b>📅 События — нажми чтобы добавить в календарь:</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
 
-        log.info(f"Digest sent: {len(messages)} messages, {len(chunks)} chunk(s), {len(events)} events.")
+    log.info(f"Sent digest: {len(messages)} messages, {len(chunks)} chunk(s), {len(events)} events.")
+
+
+async def send_digest(app: Application, chat_id: int | None = None,
+                      force_days: int | None = None, silent_if_empty: bool = False):
+    """Fetch new messages and send digest. silent_if_empty=True skips 'no new messages'."""
+    target = chat_id or CHAT_ID
+    try:
+        if force_days is not None:
+            all_msgs = portal.get_communications(limit=50)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=force_days)
+            messages = [
+                m for m in all_msgs
+                if _parse_received(m["received"]) >= cutoff
+            ]
+        else:
+            messages = portal.get_new_communications(_load_last_seen())
+
+        if not messages:
+            if not silent_if_empty:
+                await app.bot.send_message(chat_id=target, text="📭 Новых сообщений от школы нет.")
+            return
+
+        if force_days is None:
+            _save_last_seen(messages[0]["id"])
+
+        await _send_messages_and_events(app, target, messages)
 
     except Exception as e:
         log.error(f"Digest error: {e}", exc_info=True)
-        await app.bot.send_message(
-            chat_id=target,
-            text=f"⚠️ Ошибка при получении дайджеста: {e}",
-        )
+        await app.bot.send_message(chat_id=target, text=f"⚠️ Ошибка при получении дайджеста: {e}")
+
+
+def _parse_received(iso: str) -> datetime:
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+# ── Scheduled jobs ────────────────────────────────────────────────────────────
+
+async def check_new_messages(app: Application):
+    """Runs every 30 min — sends digest immediately if new messages arrived."""
+    log.info("30-min check: looking for new messages...")
+    await send_digest(app, silent_if_empty=True)
+
+
+async def send_reminders(app: Application):
+    """Runs at 8:00 — reminds about events happening today or tomorrow."""
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+    events = _load_events()
+
+    reminders = []
+    for ev in events:
+        try:
+            ev_date = date.fromisoformat(ev["date"])
+        except Exception:
+            continue
+        if ev_date == today:
+            reminders.append(f"📌 <b>Сегодня:</b> {ev['title']}")
+        elif ev_date == tomorrow:
+            reminders.append(f"⏰ <b>Завтра:</b> {ev['title']}")
+
+    if reminders:
+        text = "<b>🔔 Напоминание о событиях STAHS:</b>\n\n" + "\n".join(reminders)
+        await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+        log.info(f"Sent {len(reminders)} reminder(s).")
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я слежу за письмами школы STAHS и присылаю дайджест каждый вечер в 19:00.\n\n"
+        "👋 Привет! Я слежу за письмами школы STAHS.\n"
+        "Проверяю каждые 30 минут — как только придёт что-то новое, сразу напишу.\n"
+        "Каждое утро в 8:00 напоминаю о событиях на сегодня и завтра.\n\n"
         + MENU_TEXT,
         reply_markup=MAIN_KEYBOARD,
     )
@@ -183,19 +246,59 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_digest(ctx.application, chat_id=update.effective_chat.id, force_days=3)
 
 
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+    await update.message.reply_text(
+        "✅ Сброшено. Следующая проверка покажет все непрочитанные.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Загружаю...")
+    try:
+        messages = portal.get_communications(limit=5)
+        lines = ["<b>📬 Последние 5 сообщений:</b>\n"]
+        for m in messages:
+            lines.append(f"📌 <b>{m['subject']}</b>")
+            lines.append(f"   {portal.format_date(m['received'])}  |  id: <code>{m['id']}</code>")
+            lines.append("")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка: {e}")
+
+
+async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Использование: /read <id>")
+        return
+    await update.message.reply_text("⏳ Загружаю сообщение...")
+    try:
+        thread = portal.get_thread(ctx.args[0])
+        text = (
+            f"<b>{thread['subject']}</b>\n"
+            f"От: {thread['from']} | {portal.format_date(thread['received'])}\n\n"
+            f"{thread['body'][:3000]}"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка: {e}")
+
+
 async def cmd_auth_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not gcal.CLIENT_ID:
-        await update.message.reply_text("⚠️ GCAL_CLIENT_ID не задан в настройках бота.")
+        await update.message.reply_text("⚠️ GCAL_CLIENT_ID не задан.")
         return
     if gcal.is_authorized():
         await update.message.reply_text("✅ Google Calendar уже подключён!")
         return
     url = gcal.get_auth_url()
     await update.message.reply_text(
-        f"1️⃣ Открой ссылку и разреши доступ к Google Calendar:\n{url}\n\n"
-        "2️⃣ После разрешения браузер откроет страницу «Сайт недоступен» — это нормально.\n\n"
-        "3️⃣ Скопируй <b>полный URL</b> из адресной строки (он начинается с <code>http://localhost/?code=...</code>) "
-        "и отправь его мне:\n<code>/gcal_code ВСТАВЬ_URL_СЮДА</code>",
+        f"1️⃣ Открой ссылку и разреши доступ:\n{url}\n\n"
+        "2️⃣ Браузер откроет «Сайт недоступен» — это нормально.\n\n"
+        "3️⃣ Скопируй <b>полный URL</b> из адресной строки и отправь:\n"
+        "<code>/gcal_code ВСТАВЬ_URL_СЮДА</code>",
         parse_mode=ParseMode.HTML,
         link_preview_options={"is_disabled": True},
     )
@@ -205,28 +308,17 @@ async def cmd_gcal_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Использование: /gcal_code КОД")
         return
-    code = ctx.args[0]
     try:
-        gcal.exchange_code(code)
+        gcal.exchange_code(ctx.args[0])
         await update.message.reply_text(
-            "✅ Google Calendar подключён! Теперь бот будет автоматически добавлять события из школьных писем."
+            "✅ Google Calendar подключён! Бот будет автоматически добавлять события."
         )
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
 
-async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if STATE_FILE.exists():
-        STATE_FILE.unlink()
-    await update.message.reply_text(
-        "✅ Сброшено. Теперь /digest покажет все непрочитанные сообщения.",
-        reply_markup=MAIN_KEYBOARD,
-    )
-
-
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-
     if text in ("1", "1️⃣ Новые сообщения"):
         await update.message.reply_text("⏳ Загружаю новые сообщения...")
         await send_digest(ctx.application, chat_id=update.effective_chat.id)
@@ -241,52 +333,24 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(MENU_TEXT, reply_markup=MAIN_KEYBOARD)
 
 
-async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Загружаю...")
-    try:
-        messages = portal.get_communications(limit=5)
-        lines = ["<b>📬 Последние 5 сообщений:</b>\n"]
-        for m in messages:
-            date_str = portal.format_date(m["received"])
-            lines.append(f"📌 <b>{m['subject']}</b>")
-            lines.append(f"   {date_str}  |  id: <code>{m['id']}</code>")
-            lines.append("")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
-
-
-async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Использование: /read <id>")
-        return
-    thread_id = ctx.args[0]
-    await update.message.reply_text("⏳ Загружаю сообщение...")
-    try:
-        thread = portal.get_thread(thread_id)
-        text = (
-            f"<b>{thread['subject']}</b>\n"
-            f"От: {thread['from']} | {portal.format_date(thread['received'])}\n\n"
-            f"{thread['body'][:3000]}"
-        )
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.add_job(
-        send_digest,
-        trigger="cron",
-        hour=DIGEST_HOUR,
-        minute=DIGEST_MINUTE,
-        args=[app],
-    )
+
+    # New messages check every 30 minutes
+    scheduler.add_job(check_new_messages, trigger="interval", minutes=30, args=[app])
+
+    # Evening digest at 19:00 (silent if already sent during the day)
+    scheduler.add_job(send_digest, trigger="cron",
+                      hour=DIGEST_HOUR, minute=DIGEST_MINUTE, args=[app],
+                      kwargs={"silent_if_empty": True})
+
+    # Morning reminders at 8:00
+    scheduler.add_job(send_reminders, trigger="cron", hour=8, minute=0, args=[app])
+
     scheduler.start()
-    log.info(f"Digest scheduled at {DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d} {TZ}")
+    log.info(f"Scheduler started: 30-min checks, digest at {DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d}, reminders at 08:00 {TZ}")
 
 
 def main():
