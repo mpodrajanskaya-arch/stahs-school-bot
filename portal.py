@@ -125,8 +125,26 @@ def _save_session(cookies: dict):
     }))
 
 
+_cached_client: httpx.Client | None = None
+
+
+def _make_client(cookies: dict) -> httpx.Client:
+    return httpx.Client(
+        base_url=PORTAL_URL,
+        cookies=cookies,
+        headers=HEADERS,
+        follow_redirects=True,
+        timeout=60,
+    )
+
+
 def _get_client() -> httpx.Client:
-    """Return an authenticated httpx client, refreshing session if needed."""
+    """Return a cached authenticated httpx client, refreshing only when needed."""
+    global _cached_client
+
+    if _cached_client is not None:
+        return _cached_client
+
     session = _load_session()
     cookies = session.get("cookies") if session else None
 
@@ -134,28 +152,22 @@ def _get_client() -> httpx.Client:
         cookies = _login_httpx()
         _save_session(cookies)
 
-    client = httpx.Client(
-        base_url=PORTAL_URL,
-        cookies=cookies,
-        headers=HEADERS,
-        follow_redirects=True,
-        timeout=30,
-    )
+    client = _make_client(cookies)
 
-    # Check if session is still valid
+    # Validate session with a single lightweight check
     resp = client.get("/api/message?date_unit=latest&view=all&page_size=1")
     if resp.status_code in (401, 403) or "/login" in str(resp.url):
         cookies = _login_httpx()
         _save_session(cookies)
-        client = httpx.Client(
-            base_url=PORTAL_URL,
-            cookies=cookies,
-            headers=HEADERS,
-            follow_redirects=True,
-            timeout=30,
-        )
+        client = _make_client(cookies)
 
-    return client
+    _cached_client = client
+    return _cached_client
+
+
+def invalidate_session():
+    global _cached_client
+    _cached_client = None
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -164,6 +176,10 @@ def get_communications(limit: int = 30) -> list[dict]:
     """Return list of recent messages [{id, subject, received, read, summary}]."""
     client = _get_client()
     resp = client.get(f"/api/message?date_unit=latest&view=all&page_size={limit}")
+    if resp.status_code in (401, 403):
+        invalidate_session()
+        client = _get_client()
+        resp = client.get(f"/api/message?date_unit=latest&view=all&page_size={limit}")
     resp.raise_for_status()
     result = []
     for item in resp.json().get("data", []):
@@ -182,6 +198,10 @@ def get_thread(thread_id: str) -> dict:
     """Return full content of a message thread."""
     client = _get_client()
     resp = client.get(f"/api/message/{thread_id}")
+    if resp.status_code in (401, 403):
+        invalidate_session()
+        client = _get_client()
+        resp = client.get(f"/api/message/{thread_id}")
     resp.raise_for_status()
     messages = resp.json().get("data", [])
     if not messages:
