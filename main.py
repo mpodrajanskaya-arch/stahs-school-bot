@@ -54,8 +54,9 @@ def _escape(text: str) -> str:
     return text
 
 
-async def send_digest(app: Application):
+async def send_digest(app: Application, chat_id: int | None = None):
     """Fetch new messages, summarize, send to Telegram."""
+    target = chat_id or CHAT_ID
     log.info("Running digest...")
     try:
         last_seen = _load_last_seen()
@@ -63,7 +64,7 @@ async def send_digest(app: Application):
 
         if not messages:
             await app.bot.send_message(
-                chat_id=CHAT_ID,
+                chat_id=target,
                 text="📭 Новых сообщений от школы нет.",
             )
             return
@@ -71,20 +72,20 @@ async def send_digest(app: Application):
         # Save latest ID immediately
         _save_last_seen(messages[0]["id"])
 
-        # Build summary via Claude (or plain format if no API key)
-        summary = await summarizer.summarize(messages)
+        chunks = await summarizer.summarize(messages)
 
-        await app.bot.send_message(
-            chat_id=CHAT_ID,
-            text=summary,
-            parse_mode=ParseMode.HTML,
-        )
-        log.info(f"Digest sent: {len(messages)} messages.")
+        for chunk in chunks:
+            await app.bot.send_message(
+                chat_id=target,
+                text=chunk,
+                parse_mode=ParseMode.HTML,
+            )
+        log.info(f"Digest sent: {len(messages)} messages, {len(chunks)} chunk(s).")
 
     except Exception as e:
         log.error(f"Digest error: {e}", exc_info=True)
         await app.bot.send_message(
-            chat_id=CHAT_ID,
+            chat_id=target,
             text=f"⚠️ Ошибка при получении дайджеста: {e}",
         )
 
@@ -103,7 +104,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Загружаю новые сообщения...")
-    await send_digest(ctx.application)
+    await send_digest(ctx.application, chat_id=update.effective_chat.id)
 
 
 async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
