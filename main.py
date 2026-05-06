@@ -3,11 +3,9 @@ STAHS School Bot — daily digest of school communications via Telegram.
 Runs a scheduled digest every evening and supports on-demand commands.
 """
 
-import asyncio
 import logging
 import os
-import re
-from datetime import datetime, date
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -47,20 +45,28 @@ def _save_last_seen(thread_id: str):
     STATE_FILE.write_text(thread_id)
 
 
-def _escape(text: str) -> str:
-    """Escape special chars for Telegram MarkdownV2."""
-    for ch in r"\_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
+async def send_digest(app: Application, chat_id: int | None = None, force_days: int | None = None):
+    """Fetch new messages, summarize, send to Telegram.
 
-
-async def send_digest(app: Application, chat_id: int | None = None):
-    """Fetch new messages, summarize, send to Telegram."""
+    force_days: if set, ignore last_seen and return messages from the last N days.
+    """
     target = chat_id or CHAT_ID
     log.info("Running digest...")
     try:
-        last_seen = _load_last_seen()
-        messages = portal.get_new_communications(last_seen)
+        if force_days is not None:
+            all_msgs = portal.get_communications(limit=50)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=force_days)
+            messages = []
+            for m in all_msgs:
+                try:
+                    received = datetime.fromisoformat(m["received"].replace("Z", "+00:00"))
+                    if received >= cutoff:
+                        messages.append(m)
+                except Exception:
+                    messages.append(m)
+        else:
+            last_seen = _load_last_seen()
+            messages = portal.get_new_communications(last_seen)
 
         if not messages:
             await app.bot.send_message(
@@ -69,8 +75,8 @@ async def send_digest(app: Application, chat_id: int | None = None):
             )
             return
 
-        # Save latest ID immediately
-        _save_last_seen(messages[0]["id"])
+        if force_days is None:
+            _save_last_seen(messages[0]["id"])
 
         chunks = await summarizer.summarize(messages)
 
@@ -96,15 +102,30 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я буду присылать тебе дайджест сообщений от школы каждый вечер.\n\n"
         "Команды:\n"
-        "/digest — получить дайджест прямо сейчас\n"
-        "/latest — последние 5 сообщений\n"
-        "/read <id> — прочитать полное сообщение"
+        "/digest — новые сообщения (с прошлого раза)\n"
+        "/today — сообщения за последние 3 дня\n"
+        "/latest — последние 5 сообщений (заголовки)\n"
+        "/read <id> — прочитать полное сообщение\n"
+        "/reset — сбросить счётчик прочитанных"
     )
 
 
 async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Загружаю новые сообщения...")
     await send_digest(ctx.application, chat_id=update.effective_chat.id)
+
+
+async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Загружаю сообщения за последние 3 дня...")
+    await send_digest(ctx.application, chat_id=update.effective_chat.id, force_days=3)
+
+
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+    await update.message.reply_text(
+        "✅ Сброшено. Теперь /digest покажет все непрочитанные сообщения."
+    )
 
 
 async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -165,8 +186,10 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("read", cmd_read))
+    app.add_handler(CommandHandler("reset", cmd_reset))
 
     log.info("Bot started. Polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
