@@ -22,6 +22,7 @@ TOKEN_FILE = Path(__file__).parent / ".gcal_token.json"
 CLIENT_ID = os.getenv("GCAL_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("GCAL_CLIENT_SECRET", "")
 CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "primary")
+REDIRECT_URI = "http://localhost"
 
 
 def _client_config() -> dict:
@@ -31,7 +32,7 @@ def _client_config() -> dict:
             "client_secret": CLIENT_SECRET,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
+            "redirect_uris": [REDIRECT_URI],
         }
     }
 
@@ -41,21 +42,27 @@ def get_auth_url() -> str:
     flow = Flow.from_client_config(
         _client_config(),
         scopes=SCOPES,
-        redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+        redirect_uri=REDIRECT_URI,
     )
     auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
     return auth_url
 
 
-def exchange_code(code: str) -> bool:
-    """Exchange auth code for tokens, save to file. Returns True on success."""
+def exchange_code(code_or_url: str) -> bool:
+    """Exchange auth code (or redirect URL) for tokens. Returns True on success."""
+    # Extract code from redirect URL if user pasted the full URL
+    code = code_or_url.strip()
+    if code.startswith("http"):
+        from urllib.parse import urlparse, parse_qs
+        params = parse_qs(urlparse(code).query)
+        code = params.get("code", [code])[0]
     try:
         flow = Flow.from_client_config(
             _client_config(),
             scopes=SCOPES,
-            redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+            redirect_uri=REDIRECT_URI,
         )
-        flow.fetch_token(code=code.strip())
+        flow.fetch_token(code=code)
         creds = flow.credentials
         TOKEN_FILE.write_text(json.dumps({
             "token": creds.token,

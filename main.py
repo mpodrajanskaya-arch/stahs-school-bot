@@ -189,9 +189,12 @@ async def cmd_auth_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     url = gcal.get_auth_url()
     await update.message.reply_text(
-        f"Открой эту ссылку, разреши доступ и скопируй код обратно сюда:\n\n{url}\n\n"
-        "После этого отправь мне код командой:\n<code>/gcal_code ВАШ_КОД</code>",
+        f"1️⃣ Открой ссылку и разреши доступ к Google Calendar:\n{url}\n\n"
+        "2️⃣ После разрешения браузер откроет страницу «Сайт недоступен» — это нормально.\n\n"
+        "3️⃣ Скопируй <b>полный URL</b> из адресной строки (он начинается с <code>http://localhost/?code=...</code>) "
+        "и отправь его мне:\n<code>/gcal_code ВСТАВЬ_URL_СЮДА</code>",
         parse_mode=ParseMode.HTML,
+        link_preview_options={"is_disabled": True},
     )
 
 
