@@ -54,7 +54,9 @@ MENU_TEXT = (
     "2️⃣ — дайджест за последние 3 дня\n"
     "3️⃣ — последние 5 сообщений (заголовки)\n"
     "4️⃣ — сбросить счётчик прочитанных\n\n"
-    "Нажимай кнопки внизу или просто отправь цифру 👇"
+    "💬 Или задай любой вопрос про школу:\n"
+    "<i>«когда следующая поездка?»</i>\n"
+    "<i>«что взять на garden party?»</i>"
 )
 
 
@@ -201,6 +203,20 @@ async def check_new_messages(app: Application):
     await send_digest(app, silent_if_empty=True)
 
 
+async def send_weekly_summary(app: Application):
+    """Runs every Friday at 17:00 — this week recap + next week preview."""
+    log.info("Sending weekly summary...")
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        all_msgs = portal.get_communications(limit=50)
+        week_msgs = [m for m in all_msgs if _parse_received(m["received"]) >= cutoff]
+        upcoming = _load_events()
+        text = await summarizer.weekly_summary(week_msgs, upcoming)
+        await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.error(f"Weekly summary error: {e}", exc_info=True)
+
+
 async def send_reminders(app: Application):
     """Runs at 8:00 — reminds about events happening today or tomorrow."""
     today = date.today()
@@ -330,7 +346,14 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text in ("4", "4️⃣ Сбросить"):
         await cmd_reset(update, ctx)
     else:
-        await update.message.reply_text(MENU_TEXT, reply_markup=MAIN_KEYBOARD)
+        # Treat any other text as a question about school
+        await update.message.reply_text("🔍 Ищу ответ в письмах школы...")
+        try:
+            messages = portal.get_communications(limit=50)
+            answer = await summarizer.answer_question(text, messages)
+            await update.message.reply_text(answer, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Не смогла найти ответ: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -348,6 +371,10 @@ async def post_init(app: Application):
 
     # Morning reminders at 8:00
     scheduler.add_job(send_reminders, trigger="cron", hour=8, minute=0, args=[app])
+
+    # Weekly summary every Friday at 17:00
+    scheduler.add_job(send_weekly_summary, trigger="cron",
+                      day_of_week="fri", hour=17, minute=0, args=[app])
 
     scheduler.start()
     log.info(f"Scheduler started: 30-min checks, digest at {DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d}, reminders at 08:00 {TZ}")

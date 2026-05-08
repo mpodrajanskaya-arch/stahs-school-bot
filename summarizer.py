@@ -142,6 +142,85 @@ Current year: {current_year}.
     return summary, events
 
 
+async def answer_question(question: str, messages: list[dict]) -> str:
+    """Answer a free-form question about school using recent messages as context."""
+    if not _client:
+        return "⚠️ Для ответов на вопросы нужен Anthropic API key."
+
+    context = chr(10).join(
+        f"[{_portal.format_date(m['received'])}] {m['subject']}"
+        + (f"\n{m['summary'][:300]}" if m.get("summary") else "")
+        for m in messages[:50]
+    )
+
+    prompt = f"""Ты помощник мамы ученицы 5-го класса (Year 5) британской школы STAHS.
+У тебя есть доступ к последним письмам от школы. Ответь на вопрос мамы на русском языке.
+Если информации нет в письмах — честно скажи об этом.
+Используй только HTML-теги <b> и <i>.
+
+Письма от школы:
+{context}
+
+Вопрос: {question}"""
+
+    r = _client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return r.content[0].text.strip()
+
+
+async def weekly_summary(messages_week: list[dict], upcoming_events: list[dict]) -> str:
+    """Generate a weekly summary: what happened + what's coming next week."""
+    if not _client:
+        return _format_plain(messages_week)
+
+    from datetime import date, timedelta
+    today = date.today()
+    next_week_start = today + timedelta(days=(7 - today.weekday()))
+    next_week_end = next_week_start + timedelta(days=6)
+
+    msgs_text = chr(10).join(
+        f"[{_portal.format_date(m['received'])}] {m['subject']}"
+        + (f"\n{m['summary'][:200]}" if m.get("summary") else "")
+        for m in messages_week
+    ) or "Писем на этой неделе не было."
+
+    next_week_events = [
+        e for e in upcoming_events
+        if next_week_start.isoformat() <= e.get("date", "") <= next_week_end.isoformat()
+    ]
+    events_text = chr(10).join(
+        f"• {e['title']} — {e.get('date_label', e['date'])}"
+        for e in next_week_events
+    ) or "Нет запланированных событий."
+
+    prompt = f"""Ты помогаешь маме ученицы 5-го класса (Year 5) школы STAHS.
+Сделай еженедельную сводку на русском. Используй HTML-теги <b> и <i>.
+
+<b>📋 Итоги недели — {today.strftime('%-d %b %Y')}</b>
+
+<b>Что было на этой неделе:</b>
+[2-4 главных события/письма, по одному предложению]
+
+<b>Что предстоит на следующей неделе:</b>
+[События из списка ниже + что нужно не забыть сделать]
+
+Письма этой недели:
+{msgs_text}
+
+События следующей недели:
+{events_text}"""
+
+    r = _client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return r.content[0].text.strip()
+
+
 def _format_plain(messages: list[dict]) -> str:
     today = datetime.now().strftime("%-d %b %Y")
     lines = [
