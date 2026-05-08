@@ -78,9 +78,14 @@ def exchange_code(code_or_url: str) -> bool:
 
 
 def _get_credentials() -> Credentials | None:
-    if not TOKEN_FILE.exists():
-        return None
-    data = json.loads(TOKEN_FILE.read_text())
+    if TOKEN_FILE.exists():
+        data = json.loads(TOKEN_FILE.read_text())
+    else:
+        encoded = os.getenv("GCAL_TOKEN_JSON", "")
+        if not encoded:
+            return None
+        import base64
+        data = json.loads(base64.b64decode(encoded).decode())
     creds = Credentials(
         token=data.get("token"),
         refresh_token=data.get("refresh_token"),
@@ -103,7 +108,7 @@ def _get_credentials() -> Credentials | None:
 
 
 def is_authorized() -> bool:
-    return TOKEN_FILE.exists()
+    return TOKEN_FILE.exists() or bool(os.getenv("GCAL_TOKEN_JSON", ""))
 
 
 def create_event(title: str, date: str, time_start: str = "", time_end: str = "", details: str = "") -> str:

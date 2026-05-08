@@ -309,7 +309,11 @@ async def cmd_auth_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if gcal.is_authorized():
         await update.message.reply_text("✅ Google Calendar уже подключён!")
         return
-    url = gcal.get_auth_url()
+    try:
+        url = gcal.get_auth_url()
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка при создании ссылки: {e}")
+        return
     await update.message.reply_text(
         f"1️⃣ Открой ссылку и разреши доступ:\n{url}\n\n"
         "2️⃣ Браузер откроет «Сайт недоступен» — это нормально.\n\n"
