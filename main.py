@@ -43,6 +43,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("1️⃣ Новые сообщения"), KeyboardButton("2️⃣ За 3 дня")],
         [KeyboardButton("3️⃣ Последние 5"),     KeyboardButton("4️⃣ Сбросить")],
+        [KeyboardButton("📅 Календарь")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -53,7 +54,8 @@ MENU_TEXT = (
     "1️⃣ — новые сообщения (с прошлого раза)\n"
     "2️⃣ — дайджест за последние 3 дня\n"
     "3️⃣ — последние 5 сообщений (заголовки)\n"
-    "4️⃣ — сбросить счётчик прочитанных\n\n"
+    "4️⃣ — сбросить счётчик прочитанных\n"
+    "📅 — события школы и добавление в календарь\n\n"
     "💬 Или задай любой вопрос про школу:\n"
     "<i>«когда следующая поездка?»</i>\n"
     "<i>«что взять на garden party?»</i>"
@@ -337,6 +339,73 @@ async def cmd_gcal_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
 
+async def cmd_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    events = _load_events()
+    if not events:
+        await update.message.reply_text("📭 Сохранённых событий пока нет. Они появятся когда бот обработает письма школы.")
+        return
+
+    if gcal.is_authorized():
+        lines = ["<b>📅 События школы:</b>\n"]
+        for ev in events:
+            lines.append(f"• <b>{ev['title']}</b> — {ev.get('date_label', ev.get('date', ''))}")
+        lines.append("\n✅ Google Calendar подключён — новые события добавляются автоматически.")
+        lines.append("\nЧтобы добавить все сохранённые события сейчас — отправь /add_all_events")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    else:
+        buttons = []
+        for ev in events:
+            url = summarizer.gcal_url(
+                title=ev.get("title", ""),
+                date=ev.get("date", ""),
+                time_start=ev.get("time_start", ""),
+                time_end=ev.get("time_end", ""),
+                details=ev.get("details", "STAHS School"),
+            )
+            if url:
+                buttons.append([InlineKeyboardButton(
+                    f"📆 {ev['title']} — {ev.get('date_label', ev.get('date', ''))}",
+                    url=url,
+                )])
+        if buttons:
+            await update.message.reply_text(
+                "<b>📅 События школы — нажми чтобы добавить в календарь:</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        else:
+            await update.message.reply_text("📭 Нет событий с датами.")
+
+
+async def cmd_add_all_events(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Manually add all saved events to Google Calendar."""
+    if not gcal.is_authorized():
+        await update.message.reply_text("⚠️ Google Calendar не подключён. Используй /auth_calendar")
+        return
+    events = _load_events()
+    if not events:
+        await update.message.reply_text("📭 Нет сохранённых событий.")
+        return
+    await update.message.reply_text(f"⏳ Добавляю {len(events)} событий в Google Calendar...")
+    added, skipped = [], []
+    for ev in events:
+        try:
+            gcal.create_event(
+                title=ev.get("title", ""),
+                date=ev.get("date", ""),
+                time_start=ev.get("time_start", ""),
+                time_end=ev.get("time_end", ""),
+                details=ev.get("details", "STAHS School"),
+            )
+            added.append(f"✅ {ev['title']} — {ev.get('date_label', ev.get('date', ''))}")
+        except Exception as e:
+            skipped.append(f"⚠️ {ev['title']}: {e}")
+    result = "<b>📅 Готово!</b>\n\n" + "\n".join(added)
+    if skipped:
+        result += "\n\n" + "\n".join(skipped)
+    await update.message.reply_text(result, parse_mode=ParseMode.HTML)
+
+
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text in ("1", "1️⃣ Новые сообщения"):
@@ -349,6 +418,8 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_latest(update, ctx)
     elif text in ("4", "4️⃣ Сбросить"):
         await cmd_reset(update, ctx)
+    elif text == "📅 Календарь":
+        await cmd_calendar(update, ctx)
     else:
         # Treat any other text as a question about school
         await update.message.reply_text("🔍 Ищу ответ в письмах школы...")
@@ -400,6 +471,7 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("auth_calendar", cmd_auth_calendar))
     app.add_handler(CommandHandler("gcal_code", cmd_gcal_code))
+    app.add_handler(CommandHandler("add_all_events", cmd_add_all_events))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
     log.info("Bot started. Polling...")
