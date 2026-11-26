@@ -7,6 +7,7 @@ Login extracts stryver token from the login page HTML.
 import os
 import json
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -94,6 +95,8 @@ def _login_httpx() -> dict:
         headers={"Content-Type": "application/json"},
     )
 
+    resp.raise_for_status()
+
     # Extract session cookies
     cookies = {
         name: value
@@ -101,7 +104,7 @@ def _login_httpx() -> dict:
         if name in ("MSP_ID", "MSP_TOKEN")
     }
 
-    if not cookies:
+    if not all(cookies.get(name) for name in ("MSP_ID", "MSP_TOKEN")):
         raise RuntimeError("Login failed — no session cookies received. Check credentials in .env")
 
     return cookies
@@ -155,8 +158,9 @@ def _get_client() -> httpx.Client:
     client = _make_client(cookies)
 
     # Validate session with a single lightweight check
-    resp = client.get("/api/message?date_unit=latest&view=all&page_size=1")
-    if resp.status_code in (401, 403) or "/login" in str(resp.url):
+    resp = _get_with_retry(client, "/api/message?date_unit=latest&view=all&page_size=1")
+    if _needs_login(resp):
+        client.close()
         cookies = _login_httpx()
         _save_session(cookies)
         client = _make_client(cookies)
@@ -167,20 +171,50 @@ def _get_client() -> httpx.Client:
 
 def invalidate_session():
     global _cached_client
+    if _cached_client is not None:
+        _cached_client.close()
     _cached_client = None
+    if SESSION_FILE.exists():
+        SESSION_FILE.unlink()
+
+
+def _needs_login(resp: httpx.Response) -> bool:
+    return (resp.status_code in (401, 403)
+            or "/login" in str(resp.url)
+            or (resp.is_success and "text/html" in resp.headers.get("content-type", "")))
+
+
+def _get_with_retry(client: httpx.Client, path: str) -> httpx.Response:
+    """Retry temporary portal failures, with a bounded exponential delay."""
+    for attempt in range(3):
+        try:
+            resp = client.get(path)
+        except httpx.TransportError:
+            if attempt == 2:
+                raise
+        else:
+            if resp.status_code not in (502, 503, 504) or attempt == 2:
+                return resp
+            resp.close()
+        time.sleep(2 ** attempt)
+
+
+def _request(path: str) -> httpx.Response:
+    resp = _get_with_retry(_get_client(), path)
+    if _needs_login(resp):
+        invalidate_session()
+        resp = _get_with_retry(_get_client(), path)
+    resp.raise_for_status()
+    if _needs_login(resp):
+        raise RuntimeError("School portal session could not be renewed")
+    return resp
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def get_communications(limit: int = 30) -> list[dict]:
     """Return list of recent messages [{id, subject, received, read, summary}]."""
-    client = _get_client()
-    resp = client.get(f"/api/message?date_unit=latest&view=all&page_size={limit}")
-    if resp.status_code in (401, 403):
-        invalidate_session()
-        client = _get_client()
-        resp = client.get(f"/api/message?date_unit=latest&view=all&page_size={limit}")
-    resp.raise_for_status()
+    resp = _request(f"/api/message?date_unit=latest&view=all&page_size={limit}")
     result = []
     for item in resp.json().get("data", []):
         attrs = item.get("attributes", {})
@@ -196,13 +230,7 @@ def get_communications(limit: int = 30) -> list[dict]:
 
 def get_thread(thread_id: str) -> dict:
     """Return full content of a message thread."""
-    client = _get_client()
-    resp = client.get(f"/api/message/{thread_id}")
-    if resp.status_code in (401, 403):
-        invalidate_session()
-        client = _get_client()
-        resp = client.get(f"/api/message/{thread_id}")
-    resp.raise_for_status()
+    resp = _request(f"/api/message/{thread_id}")
     messages = resp.json().get("data", [])
     if not messages:
         return {"id": thread_id, "subject": "", "body": "", "from": "", "received": ""}

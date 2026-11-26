@@ -6,6 +6,7 @@ STAHS School Bot — monitors school communications and sends Telegram digests.
 """
 
 import json
+import asyncio
 import logging
 import os
 from datetime import datetime, date, timedelta, timezone
@@ -160,30 +161,40 @@ async def _send_messages_and_events(app, target: int, messages: list[dict]):
     log.info(f"Sent digest: {len(messages)} messages, {len(chunks)} chunk(s), {len(events)} events.")
 
 
+_digest_lock = asyncio.Lock()
+
+
 async def send_digest(app: Application, chat_id: int | None = None,
+                      force_days: int | None = None, silent_if_empty: bool = False):
+    async with _digest_lock:
+        await _send_digest(app, chat_id, force_days, silent_if_empty)
+
+
+async def _send_digest(app: Application, chat_id: int | None = None,
                       force_days: int | None = None, silent_if_empty: bool = False):
     """Fetch new messages and send digest. silent_if_empty=True skips 'no new messages'."""
     target = chat_id or CHAT_ID
     try:
         if force_days is not None:
-            all_msgs = portal.get_communications(limit=50)
+            all_msgs = await asyncio.to_thread(portal.get_communications, limit=50)
             cutoff = datetime.now(timezone.utc) - timedelta(days=force_days)
             messages = [
                 m for m in all_msgs
                 if _parse_received(m["received"]) >= cutoff
             ]
         else:
-            messages = portal.get_new_communications(_load_last_seen())
+            messages = await asyncio.to_thread(portal.get_new_communications, _load_last_seen())
 
         if not messages:
             if not silent_if_empty:
                 await app.bot.send_message(chat_id=target, text="📭 Новых сообщений от школы нет.")
             return
 
+        await _send_messages_and_events(app, target, messages)
+
+        # Only acknowledge messages after the digest has been delivered.
         if force_days is None:
             _save_last_seen(messages[0]["id"])
-
-        await _send_messages_and_events(app, target, messages)
 
     except Exception as e:
         log.error(f"Digest error: {e}", exc_info=True)
