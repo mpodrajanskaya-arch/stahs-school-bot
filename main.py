@@ -2,7 +2,7 @@
 STAHS School Bot — monitors school communications and sends Telegram digests.
 - Checks for new messages every 30 minutes, sends immediately if found
 - Daily digest at 19:00 (silent if nothing new)
-- Morning reminders at 8:00 for events happening today or tomorrow
+- Gmail action summary at 08:00; calendar managed separately
 """
 
 import json
@@ -21,7 +21,7 @@ from telegram.constants import ParseMode
 
 import portal
 import summarizer
-import gcal
+import gmail_tasks
 
 load_dotenv()
 
@@ -29,6 +29,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -44,7 +45,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("1️⃣ Новые сообщения"), KeyboardButton("2️⃣ За 3 дня")],
         [KeyboardButton("3️⃣ Последние 5"),     KeyboardButton("4️⃣ Сбросить")],
-        [KeyboardButton("📅 Календарь")],
+        [KeyboardButton("📧 Задачи из Gmail")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -56,7 +57,7 @@ MENU_TEXT = (
     "2️⃣ — дайджест за последние 3 дня\n"
     "3️⃣ — последние 5 сообщений (заголовки)\n"
     "4️⃣ — сбросить счётчик прочитанных\n"
-    "📅 — события школы и добавление в календарь\n\n"
+    "📧 — ежедневные задачи из Gmail (/gmail)\n\n"
     "💬 Или задай любой вопрос про школу:\n"
     "<i>«когда следующая поездка?»</i>\n"
     "<i>«что взять на garden party?»</i>"
@@ -112,53 +113,7 @@ async def _send_messages_and_events(app, target: int, messages: list[dict]):
             link_preview_options={"is_disabled": True},
         )
 
-    if events:
-        _save_events(events)
-
-        if gcal.is_authorized():
-            added = []
-            for ev in events:
-                try:
-                    gcal.create_event(
-                        title=ev.get("title", ""),
-                        date=ev.get("date", ""),
-                        time_start=ev.get("time_start", ""),
-                        time_end=ev.get("time_end", ""),
-                        details=ev.get("details", "STAHS School"),
-                    )
-                    added.append(f"✅ {ev['title']} — {ev.get('date_label', ev.get('date', ''))}")
-                except Exception as e:
-                    log.warning(f"Calendar event failed: {e}")
-            if added:
-                await app.bot.send_message(
-                    chat_id=target,
-                    text="<b>📅 Добавлено в Google Calendar:</b>\n" + "\n".join(added),
-                    parse_mode=ParseMode.HTML,
-                )
-        else:
-            buttons = []
-            for ev in events:
-                url = summarizer.gcal_url(
-                    title=ev.get("title", ""),
-                    date=ev.get("date", ""),
-                    time_start=ev.get("time_start", ""),
-                    time_end=ev.get("time_end", ""),
-                    details=ev.get("details", "STAHS School"),
-                )
-                if url:
-                    buttons.append([InlineKeyboardButton(
-                        f"📆 {ev['title']} — {ev.get('date_label', ev.get('date', ''))}",
-                        url=url,
-                    )])
-            if buttons:
-                await app.bot.send_message(
-                    chat_id=target,
-                    text="<b>📅 События — нажми чтобы добавить в календарь:</b>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-
-    log.info(f"Sent digest: {len(messages)} messages, {len(chunks)} chunk(s), {len(events)} events.")
+    log.info("Sent school digest: %s messages, %s chunks", len(messages), len(chunks))
 
 
 _digest_lock = asyncio.Lock()
@@ -230,27 +185,34 @@ async def send_weekly_summary(app: Application):
         log.error(f"Weekly summary error: {e}", exc_info=True)
 
 
-async def send_reminders(app: Application):
-    """Runs at 8:00 — reminds about events happening today or tomorrow."""
-    today = date.today()
-    tomorrow = today + timedelta(days=1)
-    events = _load_events()
+async def send_reminders(app):
+    """Calendar reminders are handled by the user's other bot."""
+    return
 
-    reminders = []
-    for ev in events:
+
+_gmail_lock = asyncio.Lock()
+
+async def send_gmail_actions(app, chat_id=None, scheduled=False):
+    if not gmail_tasks.is_configured():
+        if not scheduled:
+            await app.bot.send_message(chat_id=chat_id or CHAT_ID,
+                text="📧 Gmail ещё не подключён к боту. Нужен отдельный доступ Google только для чтения почты.")
+        return
+    async with _gmail_lock:
         try:
-            ev_date = date.fromisoformat(ev["date"])
+            chunks = await asyncio.to_thread(gmail_tasks.daily_digest)
+            for chunk in chunks:
+                await app.bot.send_message(chat_id=chat_id or CHAT_ID, text=chunk,
+                    link_preview_options={"is_disabled": True})
         except Exception:
-            continue
-        if ev_date == today:
-            reminders.append(f"📌 <b>Сегодня:</b> {ev['title']}")
-        elif ev_date == tomorrow:
-            reminders.append(f"⏰ <b>Завтра:</b> {ev['title']}")
+            log.error("Gmail daily digest failed", exc_info=False)
+            await app.bot.send_message(chat_id=chat_id or CHAT_ID,
+                text="⚠️ Не удалось проверить Gmail. Сводка задач не сформирована; требуется проверить подключение почты.")
 
-    if reminders:
-        text = "<b>🔔 Напоминание о событиях STAHS:</b>\n\n" + "\n".join(reminders)
-        await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
-        log.info(f"Sent {len(reminders)} reminder(s).")
+
+async def cmd_gmail(update, ctx):
+    await update.message.reply_text("⏳ Проверяю задачи из Gmail...", reply_markup=MAIN_KEYBOARD)
+    await send_gmail_actions(ctx.application, update.effective_chat.id)
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -259,7 +221,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я слежу за письмами школы STAHS.\n"
         "Проверяю каждые 30 минут — как только придёт что-то новое, сразу напишу.\n"
-        "Каждое утро в 8:00 напоминаю о событиях на сегодня и завтра.\n\n"
+        "Ежедневно в 08:00 — отдельная сводка задач из Gmail после подключения почты.\n"
+        "Календарь и напоминания о событиях ведёт другой бот.\n\n"
         + MENU_TEXT,
         reply_markup=MAIN_KEYBOARD,
     )
@@ -315,106 +278,10 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
 
-async def cmd_auth_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not gcal.CLIENT_ID:
-        await update.message.reply_text("⚠️ GCAL_CLIENT_ID не задан.")
-        return
-    if gcal.is_authorized():
-        await update.message.reply_text("✅ Google Calendar уже подключён!")
-        return
-    try:
-        url = gcal.get_auth_url()
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка при создании ссылки: {e}")
-        return
+async def cmd_calendar_disabled(update, ctx):
     await update.message.reply_text(
-        f"1️⃣ Открой ссылку и разреши доступ:\n{url}\n\n"
-        "2️⃣ Браузер откроет «Сайт недоступен» — это нормально.\n\n"
-        "3️⃣ Скопируй <b>полный URL</b> из адресной строки и отправь:\n"
-        "<code>/gcal_code ВСТАВЬ_URL_СЮДА</code>",
-        parse_mode=ParseMode.HTML,
-        link_preview_options={"is_disabled": True},
-    )
-
-
-async def cmd_gcal_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Использование: /gcal_code КОД")
-        return
-    try:
-        gcal.exchange_code(ctx.args[0])
-        await update.message.reply_text(
-            "✅ Google Calendar подключён! Бот будет автоматически добавлять события."
-        )
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
-
-
-async def cmd_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    events = _load_events()
-    if not events:
-        await update.message.reply_text("📭 Сохранённых событий пока нет. Они появятся когда бот обработает письма школы.")
-        return
-
-    if gcal.is_authorized():
-        lines = ["<b>📅 События школы:</b>\n"]
-        for ev in events:
-            lines.append(f"• <b>{ev['title']}</b> — {ev.get('date_label', ev.get('date', ''))}")
-        lines.append("\n✅ Google Calendar подключён — новые события добавляются автоматически.")
-        lines.append("\nЧтобы добавить все сохранённые события сейчас — отправь /add_all_events")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    else:
-        buttons = []
-        for ev in events:
-            url = summarizer.gcal_url(
-                title=ev.get("title", ""),
-                date=ev.get("date", ""),
-                time_start=ev.get("time_start", ""),
-                time_end=ev.get("time_end", ""),
-                details=ev.get("details", "STAHS School"),
-            )
-            if url:
-                buttons.append([InlineKeyboardButton(
-                    f"📆 {ev['title']} — {ev.get('date_label', ev.get('date', ''))}",
-                    url=url,
-                )])
-        if buttons:
-            await update.message.reply_text(
-                "<b>📅 События школы — нажми чтобы добавить в календарь:</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
-        else:
-            await update.message.reply_text("📭 Нет событий с датами.")
-
-
-async def cmd_add_all_events(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Manually add all saved events to Google Calendar."""
-    if not gcal.is_authorized():
-        await update.message.reply_text("⚠️ Google Calendar не подключён. Используй /auth_calendar")
-        return
-    events = _load_events()
-    if not events:
-        await update.message.reply_text("📭 Нет сохранённых событий.")
-        return
-    await update.message.reply_text(f"⏳ Добавляю {len(events)} событий в Google Calendar...")
-    added, skipped = [], []
-    for ev in events:
-        try:
-            gcal.create_event(
-                title=ev.get("title", ""),
-                date=ev.get("date", ""),
-                time_start=ev.get("time_start", ""),
-                time_end=ev.get("time_end", ""),
-                details=ev.get("details", "STAHS School"),
-            )
-            added.append(f"✅ {ev['title']} — {ev.get('date_label', ev.get('date', ''))}")
-        except Exception as e:
-            skipped.append(f"⚠️ {ev['title']}: {e}")
-    result = "<b>📅 Готово!</b>\n\n" + "\n".join(added)
-    if skipped:
-        result += "\n\n" + "\n".join(skipped)
-    await update.message.reply_text(result, parse_mode=ParseMode.HTML)
+        "📅 Календарь и напоминания о событиях отключены здесь: ими занимается бот Вани. Здесь остаются важные письма и действия.",
+        reply_markup=MAIN_KEYBOARD)
 
 
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -430,7 +297,9 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text in ("4", "4️⃣ Сбросить"):
         await cmd_reset(update, ctx)
     elif text == "📅 Календарь":
-        await cmd_calendar(update, ctx)
+        await cmd_calendar_disabled(update, ctx)
+    elif text == "📧 Задачи из Gmail":
+        await cmd_gmail(update, ctx)
     else:
         # Treat any other text as a question about school
         await update.message.reply_text("🔍 Ищу ответ в письмах школы...")
@@ -455,18 +324,21 @@ async def post_init(app: Application):
                       hour=DIGEST_HOUR, minute=DIGEST_MINUTE, args=[app],
                       kwargs={"silent_if_empty": True})
 
-    # Morning reminders at 8:00
-    scheduler.add_job(send_reminders, trigger="cron", hour=8, minute=0, args=[app])
+    # Separate Gmail action digest, no calendar reminders.
+    scheduler.add_job(send_gmail_actions, trigger="cron", hour=8, minute=0, args=[app],
+                      kwargs={"scheduled": True}, coalesce=True, misfire_grace_time=3600)
 
     # Weekly summary every Friday at 17:00
     scheduler.add_job(send_weekly_summary, trigger="cron",
                       day_of_week="fri", hour=17, minute=0, args=[app])
 
     scheduler.start()
-    log.info(f"Scheduler started: 30-min checks, digest at {DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d}, reminders at 08:00 {TZ}")
+    log.info(f"Scheduler started: 30-min checks, digest at {DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d}, Gmail actions at 08:00 {TZ}; calendar disabled")
 
 
 def main():
+    if not CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID is required")
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -474,16 +346,19 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("digest", cmd_digest))
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("latest", cmd_latest))
-    app.add_handler(CommandHandler("read", cmd_read))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("auth_calendar", cmd_auth_calendar))
-    app.add_handler(CommandHandler("gcal_code", cmd_gcal_code))
-    app.add_handler(CommandHandler("add_all_events", cmd_add_all_events))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+    owner = filters.Chat(CHAT_ID)
+    app.add_handler(CommandHandler("gmail", cmd_gmail, filters=owner))
+    app.add_handler(CommandHandler("calendar", cmd_calendar_disabled, filters=owner))
+    app.add_handler(CommandHandler("start", cmd_start, filters=owner))
+    app.add_handler(CommandHandler("digest", cmd_digest, filters=owner))
+    app.add_handler(CommandHandler("today", cmd_today, filters=owner))
+    app.add_handler(CommandHandler("latest", cmd_latest, filters=owner))
+    app.add_handler(CommandHandler("read", cmd_read, filters=owner))
+    app.add_handler(CommandHandler("reset", cmd_reset, filters=owner))
+    app.add_handler(CommandHandler("auth_calendar", cmd_calendar_disabled, filters=owner))
+    app.add_handler(CommandHandler("gcal_code", cmd_calendar_disabled, filters=owner))
+    app.add_handler(CommandHandler("add_all_events", cmd_calendar_disabled, filters=owner))
+    app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, handle_button))
 
     log.info("Bot started. Polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
